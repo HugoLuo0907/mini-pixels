@@ -49,3 +49,13 @@ resources/*.xml
 *.so
 *.o
 .vscode
+# LaTeX 编译中间文件
+*.aux
+*.out
+*.log
+*.toc
+*.synctex.gz
+
+# 备份文件
+*.bak
+*.bak2

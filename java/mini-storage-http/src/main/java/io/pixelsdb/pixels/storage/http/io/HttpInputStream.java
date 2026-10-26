@@ -36,76 +36,40 @@ public class HttpInputStream extends InputStream
 {
     private static final Logger logger = LogManager.getLogger(HttpInputStream.class);
 
-    /**
-     * indicates whether the http is still open / valid
-     */
     private boolean open;
-
-    /**
-     * The schema of http.
-     * Default value is http.
-     */
     private final String schema = "http";
-
-    /**
-     * The host of http.
-     */
     private String host;
-
-    /**
-     * The port of http.
-     */
     private int port;
-
-    /**
-     * The uri of http.
-     */
     private String uri;
 
     /**
-     * The temporary buffer used for storing the chunks.
+     * 改为 LinkedBlockingQueue：纯 FIFO 场景下双端操作多余，
+     * 且 put/take 分离锁可降低生产者-消费者锁竞争。
      */
     private final BlockingQueue<ByteBuf> contentQueue;
 
-    /**
-     * The maximum tries to get data.
-     */
-    private final int MAX_TRIES = Constants.MAX_STREAM_RETRY_COUNT;
+    /** 当前正在消费的 ByteBuf，避免每轮循环 peek() 加锁。 */
+    private ByteBuf currentBuf;
 
-    /**
-     * The milliseconds to sleep.
-     */
+    private final int MAX_TRIES = Constants.MAX_STREAM_RETRY_COUNT;
     private final long DELAY_MS = Constants.STREAM_DELAY_MS;
 
-    /**
-     * The http server for receiving input http.
-     */
     private final HttpServer httpServer;
-
-    /**
-     * The thread to run http server.
-     */
     private final ExecutorService executorService;
-
-    /**
-     * The future of http server.
-     */
     private final CompletableFuture<Void> httpServerFuture;
 
     public HttpInputStream(String host, int port) throws CertificateException, SSLException {
         this.open = true;
-        this.contentQueue = new LinkedBlockingDeque<>();
+        this.contentQueue = new LinkedBlockingQueue<>();
         this.host = host;
         this.port = port;
         this.uri = this.schema + "://" + host + ":" + port;
         this.httpServer = new HttpServer(new StreamHttpServerHandler(this.contentQueue));
         this.executorService = Executors.newFixedThreadPool(1);
         this.httpServerFuture = CompletableFuture.runAsync(() -> {
-            try
-            {
+            try {
                 this.httpServer.serve(this.port);
-            } catch (InterruptedException e)
-            {
+            } catch (InterruptedException e) {
                 logger.error("http server interrupted", e);
             }
         }, this.executorService);
@@ -115,23 +79,15 @@ public class HttpInputStream extends InputStream
     public int read() throws IOException
     {
         assertOpen();
-        if (emptyData())
-        {
-            return -1;
-        }
-
-        ByteBuf content = this.contentQueue.peek();
-        int b = -1;
-        if (content != null)
-        {
-            b = content.readUnsignedByte();
-            if (!content.isReadable())
-            {
-                content.release();
-                this.contentQueue.poll();
+        if (this.currentBuf == null || !this.currentBuf.isReadable()) {
+            if (this.currentBuf != null) {
+                this.currentBuf.release();
+                this.currentBuf = null;
             }
+            this.currentBuf = pollContent();
+            if (this.currentBuf == null) return -1;
         }
-        return b;
+        return this.currentBuf.readUnsignedByte();
     }
 
     @Override
@@ -140,131 +96,114 @@ public class HttpInputStream extends InputStream
         return read(b, 0, b.length);
     }
 
-    /**
-     * Attempt to read data with a maximum length of len into the position off of buf.
-     * @param buf
-     * @param off
-     * @param len
-     * @return Actual number of bytes read
-     * @throws IOException
-     */
     @Override
     public int read(byte[] buf, int off, int len) throws IOException
     {
         assertOpen();
+        if (len == 0) return 0;
 
-        ByteBuf content;
         int readBytes = 0;
-        while (readBytes < len)
-        {
-            if (emptyData())
-            {
-                return readBytes > 0 ? readBytes : -1;
-            }
-            content = this.contentQueue.peek();
-            if (content == null)
-            {
-                return readBytes > 0 ? readBytes : -1;
-            }
-
-            try
-            {
-                int readLen = Math.min(len - readBytes, content.readableBytes());
-                content.readBytes(buf, off + readBytes, readLen);
-                readBytes += readLen;
-                if (!content.isReadable())
-                {
-                    contentQueue.poll();
-                    content.release();
+        while (readBytes < len) {
+            if (this.currentBuf == null || !this.currentBuf.isReadable()) {
+                if (this.currentBuf != null) {
+                    this.currentBuf.release();
+                    this.currentBuf = null;
                 }
-            } catch (Exception e) {
-                if (!content.isReadable())
-                {
-                    contentQueue.poll();
-                    content.release();
+                this.currentBuf = pollContent();
+                if (this.currentBuf == null) {
+                    return readBytes > 0 ? readBytes : -1;
                 }
-                throw e;
             }
+            int readLen = Math.min(len - readBytes, this.currentBuf.readableBytes());
+            this.currentBuf.readBytes(buf, off + readBytes, readLen);
+            readBytes += readLen;
         }
-
         return readBytes;
     }
 
     @Override
     public void close() throws IOException
     {
-        if (this.open)
-        {
+        if (this.open) {
             this.open = false;
             this.httpServerFuture.complete(null);
             this.httpServer.close();
+            releaseResources();
         }
     }
 
-    private boolean emptyData() throws IOException
+    /** 释放 currentBuf 与队列中残留的 ByteBuf，防止 Netty 直接内存泄漏。 */
+    private void releaseResources()
     {
-        int tries = 0;
-        while (tries < this.MAX_TRIES && this.contentQueue.isEmpty() && !this.httpServerFuture.isDone())
-        {
-            try
-            {
-                tries++;
-                Thread.sleep(this.DELAY_MS);
-            } catch (InterruptedException e)
-            {
-                throw new IOException(e);
-            }
+        if (this.currentBuf != null) {
+            this.currentBuf.release();
+            this.currentBuf = null;
         }
-        if (tries == this.MAX_TRIES)
-        {
-            logger.error("retry count {}, httpServerFuture {}, " +
-                    "exception cause: HttpInputStream failed to receive data", tries, this.httpServerFuture.isDone());
+        ByteBuf buf;
+        while ((buf = this.contentQueue.poll()) != null) {
+            buf.release();
         }
+    }
 
-        return this.contentQueue.isEmpty();
+    /** 使用队列的带超时 poll 替代固定 Thread.sleep 忙等待。 */
+    private ByteBuf pollContent() throws IOException
+    {
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos((long) this.MAX_TRIES * this.DELAY_MS);
+        long deadline = System.nanoTime() + timeoutNanos;
+        try {
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    logger.error("retry count {}, httpServerFuture {}, exception cause: " +
+                                    "HttpInputStream failed to receive data within {} ms",
+                            this.MAX_TRIES, this.httpServerFuture.isDone(),
+                            (long) this.MAX_TRIES * this.DELAY_MS);
+                    return null;
+                }
+                ByteBuf buf = this.contentQueue.poll(remaining, TimeUnit.NANOSECONDS);
+                if (buf != null) return buf;
+                if (this.httpServerFuture.isDone()) {
+                    return this.contentQueue.poll(); // 最终非阻塞 drain
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for data", e);
+        }
     }
 
     private void assertOpen()
     {
-        if (!this.open)
-        {
-            throw new IllegalStateException("Closed");
-        }
+        if (!this.open) throw new IllegalStateException("Closed");
     }
 
     public static class StreamHttpServerHandler extends HttpServerHandler
     {
         private static final Logger logger = LogManager.getLogger(StreamHttpServerHandler.class);
-        private final BlockingQueue<ByteBuf> contenQueue;
+        private final BlockingQueue<ByteBuf> contentQueue;
 
-        public StreamHttpServerHandler(BlockingQueue<ByteBuf> contenQueue)
+        public StreamHttpServerHandler(BlockingQueue<ByteBuf> contentQueue)
         {
-            this.contenQueue = contenQueue;
+            this.contentQueue = contentQueue;
         }
 
         @Override
         public void channelRead0(ChannelHandlerContext ctx, HttpObject msg)
         {
-            if (!(msg instanceof HttpRequest))
-            {
-                return;
-            }
+            if (!(msg instanceof HttpRequest)) return;
             FullHttpRequest req = (FullHttpRequest) msg;
-            if (req.method() != HttpMethod.POST)
-            {
+            if (req.method() != HttpMethod.POST) {
                 sendResponse(ctx, req, HttpResponseStatus.OK);
                 return;
             }
-
-            if (!req.headers().get(HttpHeaderNames.CONTENT_TYPE).equals("application/x-protobuf"))
-            {
+            // 常量前置，避免 header 缺失时 NPE
+            if (!"application/x-protobuf".equals(req.headers().get(HttpHeaderNames.CONTENT_TYPE))) {
                 return;
             }
             ByteBuf content = req.content();
-            if (content.isReadable())
-            {
+            if (content.isReadable()) {
                 content.retain();
-                this.contenQueue.add(content);
+                this.contentQueue.add(content);
             }
             sendResponse(ctx, req, HttpResponseStatus.OK);
         }
@@ -276,14 +215,12 @@ public class HttpInputStream extends InputStream
                     .set(HttpHeaderNames.CONTENT_TYPE, "text/plain")
                     .set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
 
-            if (req.headers().get(HttpHeaderNames.CONNECTION).equals(HttpHeaderValues.CLOSE.toString()))
-            {
+            if (HttpHeaderValues.CLOSE.toString().equals(req.headers().get(HttpHeaderNames.CONNECTION))) {
                 response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
                 response.setStatus(status);
                 ctx.writeAndFlush(response);
                 this.serverCloser.run();
-            } else
-            {
+            } else {
                 response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
                 response.setStatus(status);
                 ctx.writeAndFlush(response);

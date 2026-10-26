@@ -36,70 +36,26 @@ public class HttpOutputStream extends OutputStream
 {
     private static final Logger logger = LogManager.getLogger(HttpOutputStream.class);
 
-    /**
-     * indicates whether the http is still open / valid
-     */
     private boolean open;
-
-    /**
-     * The schema of http.
-     * Default value is http.
-     */
     private final String schema = "http";
-
-    /**
-     * The host of http.
-     */
     private String host;
-
-    /**
-     * The port of http.
-     */
     private int port;
-
-    /**
-     * The uri of http.
-     */
     private String uri;
 
-    /**
-     * The maximum retry count.
-     */
     private static final int MAX_RETRIES = Constants.MAX_STREAM_RETRY_COUNT;
-
-    /**
-     * The delay between two tries.
-     */
     private static final long RETRY_DELAY_MS = Constants.STREAM_DELAY_MS;
 
-    /**
-     * The temporary buffer used for storing the chunks.
-     */
+    /** 有界队列容量，用于形成背压，防止生产速度远大于发送速度导致堆内存无限增长。 */
+    private static final int QUEUE_CAPACITY = 16;
+
     private final byte[] buffer;
-
-    /**
-     * The position in the buffer.
-     */
     private int bufferPosition;
-
-    /**
-     * The capacity of buffer.
-     */
     private int bufferCapacity;
 
-    /**
-     * The background thread to send requests.
-     */
     private final ExecutorService executorService;
-
-    /**
-     * The http client.
-     */
     private final AsyncHttpClient httpClient;
 
-    /**
-     * The queue to put pending requests.
-     */
+    /** 有界阻塞队列，队列满时生产者阻塞，形成背压。 */
     private final BlockingQueue<byte[]> contentQueue;
 
     public HttpOutputStream(String host, int port, int bufferCapacity) {
@@ -112,43 +68,30 @@ public class HttpOutputStream extends OutputStream
         this.bufferPosition = 0;
         this.httpClient = Dsl.asyncHttpClient();
         this.executorService = Executors.newSingleThreadExecutor();
-        this.contentQueue = new LinkedBlockingQueue<>();
+        this.contentQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
-        // Start background thread to send requests.
         this.executorService.submit(() -> {
-            while (true)
-            {
-                try
-                {
+            while (true) {
+                try {
                     byte[] content = contentQueue.take();
-                    if (content.length == 0)
-                    {
+                    if (content.length == 0) {
                         closeStreamReader();
                         break;
                     }
                     sendContentWithRetry(content);
-                } catch (InterruptedException e)
-                {
+                } catch (InterruptedException e) {
                     logger.error("Background thread interrupted", e);
                     break;
                 }
             }
-            try
-            {
+            try {
                 this.httpClient.close();
-            } catch (IOException e)
-            {
+            } catch (IOException e) {
                 throw new RuntimeException(e);
             }
         });
     }
 
-    /**
-     * Write an array to the S3 output http
-     *
-     * @param b
-     * @throws IOException
-     */
     @Override
     public void write(byte[] b) throws IOException
     {
@@ -161,8 +104,7 @@ public class HttpOutputStream extends OutputStream
         this.assertOpen();
         int offsetInBuf = off, remainToRead = len;
         int remainInBuffer;
-        while (remainToRead > (remainInBuffer = this.buffer.length - bufferPosition))
-        {
+        while (remainToRead > (remainInBuffer = this.buffer.length - bufferPosition)) {
             System.arraycopy(buf, offsetInBuf, this.buffer, this.bufferPosition, remainInBuffer);
             this.bufferPosition += remainInBuffer;
             flushBufferAndRewind();
@@ -177,52 +119,62 @@ public class HttpOutputStream extends OutputStream
     public void write(int b) throws IOException
     {
         this.assertOpen();
-        if (this.bufferPosition >= this.buffer.length)
-        {
+        if (this.bufferPosition >= this.buffer.length) {
             flushBufferAndRewind();
         }
         this.buffer[this.bufferPosition++] = (byte) b;
     }
 
     @Override
-    public synchronized void flush()
+    public synchronized void flush() throws IOException
     {
         assertOpen();
-        if (this.bufferPosition > 0)
-        {
-            this.contentQueue.add(Arrays.copyOfRange(this.buffer, 0, this.bufferPosition));
+        if (this.bufferPosition > 0) {
+            byte[] content = Arrays.copyOf(this.buffer, this.bufferPosition);
             this.bufferPosition = 0;
+            putContent(content);
         }
     }
 
     protected void flushBufferAndRewind() throws IOException
     {
         logger.debug("Sending {} bytes to http", this.bufferPosition);
-        byte[] content = Arrays.copyOfRange(this.buffer, 0, this.bufferPosition);
+        byte[] content = Arrays.copyOf(this.buffer, this.bufferPosition);
         this.bufferPosition = 0;
-        this.contentQueue.add(content);
+        putContent(content);
+    }
+
+    /** 将数据放入有界队列；队列满时阻塞，形成背压。 */
+    private void putContent(byte[] content) throws IOException
+    {
+        try {
+            this.contentQueue.put(content);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for queue space", e);
+        }
     }
 
     @Override
     public void close() throws IOException
     {
-        if (this.open)
-        {
+        if (this.open) {
             this.open = false;
-            if (this.bufferPosition > 0)
-            {
+            if (this.bufferPosition > 0) {
                 flush();
             }
-            this.contentQueue.add(new byte[0]);
+            try {
+                this.contentQueue.put(new byte[0]); // 结束标记
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while sending close marker", e);
+            }
             this.executorService.shutdown();
-            try
-            {
-                if (!this.executorService.awaitTermination(60, TimeUnit.SECONDS))
-                {
+            try {
+                if (!this.executorService.awaitTermination(60, TimeUnit.SECONDS)) {
                     this.executorService.shutdownNow();
                 }
-            } catch (InterruptedException e)
-            {
+            } catch (InterruptedException e) {
                 throw new IOException("Interrupted while waiting for termination", e);
             }
         }
@@ -231,10 +183,8 @@ public class HttpOutputStream extends OutputStream
     private void sendContentWithRetry(byte[] content)
     {
         int retry = 0;
-        while (retry <= MAX_RETRIES)
-        {
-            try
-            {
+        while (retry <= MAX_RETRIES) {
+            try {
                 Request req = httpClient.preparePost(this.uri)
                         .setBody(ByteBuffer.wrap(content))
                         .addHeader(HttpHeaderNames.CONTENT_TYPE, "application/x-protobuf")
@@ -243,20 +193,16 @@ public class HttpOutputStream extends OutputStream
                         .build();
                 httpClient.executeRequest(req).get();
                 break;
-            } catch (Exception e)
-            {
+            } catch (Exception e) {
                 retry++;
                 if (retry > MAX_RETRIES ||
-                        !(e.getCause() instanceof java.net.ConnectException || e.getCause() instanceof java.io.IOException))
-                {
+                        !(e.getCause() instanceof java.net.ConnectException || e.getCause() instanceof java.io.IOException)) {
                     logger.error("Failed to send content after {} retries, exception: {}", retry, e.getMessage());
                     break;
                 }
-                try
-                {
+                try {
                     Thread.sleep(RETRY_DELAY_MS);
-                } catch (InterruptedException e1)
-                {
+                } catch (InterruptedException e1) {
                     logger.error("Retry interrupted", e1);
                     break;
                 }
@@ -264,9 +210,6 @@ public class HttpOutputStream extends OutputStream
         }
     }
 
-    /**
-     * Tell http reader that this http closes.
-     */
     private void closeStreamReader()
     {
         Request req = httpClient.preparePost(this.uri)
@@ -275,25 +218,19 @@ public class HttpOutputStream extends OutputStream
                 .addHeader(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE)
                 .build();
         int retry = 0;
-        while (retry <= MAX_RETRIES)
-        {
-            try
-            {
+        while (retry <= MAX_RETRIES) {
+            try {
                 httpClient.executeRequest(req).get();
                 break;
-            } catch (Exception e)
-            {
+            } catch (Exception e) {
                 retry++;
-                if (retry > MAX_RETRIES || !(e.getCause() instanceof java.net.ConnectException))
-                {
+                if (retry > MAX_RETRIES || !(e.getCause() instanceof java.net.ConnectException)) {
                     logger.error("Failed to close http reader after {} retries, exception: {}", retry, e.getMessage());
                     break;
                 }
-                try
-                {
+                try {
                     Thread.sleep(RETRY_DELAY_MS);
-                } catch (InterruptedException e1)
-                {
+                } catch (InterruptedException e1) {
                     logger.error("Retry interrupted", e1);
                     break;
                 }
@@ -303,9 +240,6 @@ public class HttpOutputStream extends OutputStream
 
     private void assertOpen()
     {
-        if (!this.open)
-        {
-            throw new IllegalStateException("Closed");
-        }
+        if (!this.open) throw new IllegalStateException("Closed");
     }
 }

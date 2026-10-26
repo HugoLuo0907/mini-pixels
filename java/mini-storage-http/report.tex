@@ -1,0 +1,82 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\lstset{basicstyle=\ttfamily\small, breaklines=true, frame=single}
+
+\title{Mini-Pixels HTTP 流存储读写性能优化实验报告}
+\author{罗呈语}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{实验背景与目标}
+PixelsDB 是一个分布式数据库系统，节点间数据传输依赖 HTTP 协议。本次实验针对 \texttt{mini-storage-http} 模块中的 \texttt{HttpInputStream} 与 \texttt{HttpOutputStream} 进行性能优化。原实现存在忙等待、队列锁操作冗余、内存无界增长等问题，在高吞吐场景下会导致 CPU 空转、延迟增加甚至内存溢出。本实验的目标是在不改变外部接口的前提下，消除确定性开销、引入背压机制，并修复潜在的内存泄漏。
+
+\section{实验环境}
+\begin{itemize}
+    \item 操作系统：Ubuntu 24.04（WSL2）
+    \item JDK：OpenJDK 21
+    \item 构建工具：Maven 3.x，Surefire 3.2.5
+    \item 项目：\texttt{mini-pixels}，模块 \texttt{mini-storage-http}
+    \item 测试类：\texttt{TestHttpStream}
+\end{itemize}
+
+\section{原始代码问题分析}
+
+\subsection{HttpInputStream}
+\begin{enumerate}
+    \item \textbf{忙等待}：\texttt{emptyData()} 使用 \texttt{Thread.sleep(DELAY\_MS)} 轮询队列，即使数据在睡眠期间到达也必须等待睡眠结束，浪费 CPU 并增加延迟。
+    \item \textbf{队列操作冗余}：\texttt{read()} 与 \texttt{read(byte[],int,int)} 每轮循环先 \texttt{peek()} 再在耗尽后 \texttt{poll()}，每个 ByteBuf 触发两次加锁操作。
+    \item \textbf{队列类型低效}：\texttt{LinkedBlockingDeque} 支持双端操作，但本场景仅需 FIFO，双端能力带来额外开销。
+    \item \textbf{内存泄漏}：\texttt{close()} 未释放队列中残留的 \texttt{ByteBuf} 与当前正在消费的 \texttt{ByteBuf}，Netty 直接内存可能泄漏。
+\end{enumerate}
+
+\subsection{HttpOutputStream}
+\begin{enumerate}
+    \item \textbf{无界队列导致 OOM}：\texttt{contentQueue} 为无界 \texttt{LinkedBlockingQueue}，当发送速度低于写入速度时，队列无限增长，最终耗尽堆内存。这是实验中 \texttt{OutOfMemoryError} 的直接原因。
+    \item \textbf{频繁数组复制}：\texttt{flushBufferAndRewind()} 与 \texttt{flush()} 每次使用 \texttt{Arrays.copyOfRange} 生成新数组，产生大量临时垃圾。
+    \item \textbf{缺少背压}：写入端不感知发送端进度，无法自适应降速。
+\end{enumerate}
+
+\section{优化方案}
+
+\subsection{HttpInputStream 优化}
+\begin{itemize}
+    \item 将 \texttt{emptyData()} 的 \texttt{Thread.sleep} 轮询替换为 \texttt{contentQueue.poll(timeout, NANOSECONDS)}，保留原 \texttt{MAX\_TRIES × DELAY\_MS} 的总超时语义。
+    \item 新增 \texttt{currentBuf} 字段持有当前 \texttt{ByteBuf}，每个块只执行一次 \texttt{poll()}，消除 \texttt{peek()+poll()} 双重操作。
+    \item 队列类型改为 \texttt{LinkedBlockingQueue}，利用 put/take 分离锁降低生产者-消费者锁竞争。
+    \item \texttt{close()} 中调用 \texttt{releaseResources()}，释放 \texttt{currentBuf} 并排空队列中所有 \texttt{ByteBuf}。
+    \item 修正 \texttt{StreamHttpServerHandler} 中 header 判断的潜在 NPE（常量前置）。
+\end{itemize}
+
+\subsection{HttpOutputStream 优化}
+\begin{itemize}
+    \item 将 \texttt{contentQueue} 改为有界 \texttt{ArrayBlockingQueue(QUEUE\_CAPACITY)}，容量设为 16。队列满时 \texttt{put()} 阻塞写入线程，形成背压，防止内存无限增长。
+    \item \texttt{flush()} 与 \texttt{flushBufferAndRewind()} 使用 \texttt{putContent()} 封装 \texttt{put()}，将 \texttt{InterruptedException} 转为 \texttt{IOException}。
+    \item \texttt{close()} 发送结束标记也使用 \texttt{put()}，确保结束标记在队列有空间时入队。
+    \item 保留原有重试与连接复用逻辑，未改变 HTTP 语义。
+\end{itemize}
+
+\section{预期效果与定性分析}
+\begin{itemize}
+    \item \textbf{CPU 占用下降}：忙等待消除后，接收端在无数据时进入阻塞等待，不再周期性唤醒。
+    \item \textbf{接收吞吐提升}：减少队列锁操作次数，尤其在大块连续读取时效果明显。
+    \item \textbf{内存稳定}：发送端有界队列形成背压，写入速度自动匹配发送速度，避免 \texttt{OutOfMemoryError}。
+    \item \textbf{资源泄漏修复}：\texttt{close()} 释放所有 \texttt{ByteBuf}，Netty 直接内存可被及时回收。
+\end{itemize}
+由于实验重点在于代码级优化与问题修复，未进行大规模性能数据采集；上述效果基于代码路径分析与 JDK/Netty 的通用行为得出。
+
+\section{心得体会}
+本次实验最大的收获是\textbf{“先定位确定性开销，再谈优化”}。最初面对 \texttt{OutOfMemoryError} 时容易直接调大堆内存，但日志显示 OOM 发生在 \texttt{LinkedBlockingQueue.offer}，说明根因是发送端队列无界导致生产速度远大于消费速度。引入有界队列和 \texttt{put()} 阻塞后，写入端自然降速，内存问题从机制上被消除。另一方面，接收端的 \texttt{Thread.sleep} 忙等待和 \texttt{peek()+poll()} 双重操作是典型的“隐蔽开销”，单次影响不大，但在高吞吐下会被放大。通过 \texttt{currentBuf} 持有当前块、用 \texttt{poll(timeout)} 替代轮询，代码更简洁且语义更清晰。这让我体会到：优化不是盲目改参数，而是理解数据流与控制流，在正确的环节施加背压和减少锁竞争。
+
+\section{AI 辅助声明}
+本报告中的问题定位思路、优化方案设计（包括忙等待替换、\texttt{currentBuf} 减少队列操作、有界队列背压机制）在 AI 辅助下完成；具体代码修改、编译调试与实验环境配置由本人独立实施并验证。报告中所有结论均基于对原始代码与运行日志的分析。
+
+\end{document}
